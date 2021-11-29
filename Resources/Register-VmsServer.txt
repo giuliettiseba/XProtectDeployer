@@ -1,0 +1,179 @@
+function Register-VmsServer {
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string[]]
+        $ComputerName = 'localhost',
+
+        [Parameter(Mandatory)]
+        [Uri]
+        $AuthServer,
+
+        [Parameter(Mandatory)]
+        [pscredential]
+        $Credentials,
+
+        [Parameter()]
+        [switch]
+        $AsJob
+    )
+
+    process {
+        $script = {
+            param([string]$Uri, [string]$username, [string]$password)
+            $credential = [pscredential]::new($username, ($password | ConvertTo-SecureString -AsPlainText -Force))
+
+            # Test that the server configurator executable is available and the URI path is valid
+            $path = 'C:\Program Files\Milestone\Server Configurator\ServerConfigurator.exe'
+            if (-not (Test-Path $path)) {
+                throw [io.FileNotFoundException]::new('ServerConfigurator.exe not found', $path)
+            }
+            $null = Invoke-RestMethod -Uri $Uri -ErrorAction Stop
+
+            # Register a scheduled task in Windows as a workaround for the double-hop limitation
+            $jobName = 'Register Milestone XProtect Services'
+            Get-ScheduledJob -Name $jobName -ErrorAction Ignore | Unregister-ScheduledJob -Force -ErrorAction Stop
+            $options = New-ScheduledJobOption -RunElevated
+            $jobDefinition = Register-ScheduledJob -Name $jobName -ScriptBlock {
+                param([string]$path, [string]$uri)
+
+                function Invoke-Process {
+                    [CmdletBinding()]
+                    param(
+                        [Parameter(Mandatory)]
+                        [string]
+                        $Path,
+
+                        [Parameter()]
+                        [string]
+                        $Arguments,
+
+                        # Hashtable where non-zero integer keys are paired with string values
+                        [Parameter()]
+                        [hashtable]
+                        $ErrorMessages
+                    )
+
+                    process {
+                        $process = [diagnostics.process]::new()
+                        $process.StartInfo.FileName = $Path
+                        $process.StartInfo.Arguments = $Arguments
+                        $process.StartInfo.UseShellExecute = $false
+                        $process.StartInfo.CreateNoWindow = $true
+                        $process.StartInfo.RedirectStandardOutput = $true
+                        $process.StartInfo.RedirectStandardError = $true
+                        $null = $process.Start()
+                        $process.WaitForExit()
+                        $stdOut = $process.StandardOutput.ReadToEnd()
+                        $stdErr = $process.StandardError.ReadToEnd()
+
+                        if (-not [string]::IsNullOrWhiteSpace($stdOut)) {
+                            Write-Host $stdOut
+                        }
+
+                        if ($process.ExitCode -ne 0) {
+                            $filename = $process.StartInfo.FileName | Split-Path -Leaf
+                            $message = $ErrorMessages[$process.ExitCode]
+                            if ($message) {
+                                Write-Error "$($filename): $message"
+                            }
+                            elseif (-not [string]::IsNullOrWhiteSpace($stdErr)) {
+                                Write-Error "$($filename): $stdErr"
+                            }
+                            elseif (-not [string]::IsNullOrWhiteSpace($stdOut)) {
+                                Write-Error "$($filename): $stdOut"
+                            }
+                            else {
+                                Write-Error "$filename exited with ExitCode $($process.ExitCode)"
+                            }
+                        }
+                    }
+                }
+
+                $exitCodes = @{
+                    0 = 'Success'
+                    -1 = 'Unknown error'
+                    -2 = 'Invalid arguments'
+                    -3 = 'Invalid argument value'
+                    -4 = 'Another instance is running'
+                }
+                $startInfo = @{
+                    Path = $path
+                    Arguments = "/register /authaddress=$uri /quiet"
+                    ErrorMessages = $exitCodes
+                }
+                Invoke-Process @startInfo
+            } -ArgumentList $path, $uri -Credential $credential -ScheduledJobOption $options -RunNow
+
+            # Wait until the ScheduledJob generates a Job that we can receive results for. It can take a few seconds
+            $timeout = (Get-Date).AddMinutes(1)
+            do {
+                if ((Get-Date) -gt $timeout) {
+                    throw "The scheduledjob has not started after a timeout duration of one minute."
+                }
+                $job = Get-Job -Name $jobDefinition.Name -ErrorAction Ignore
+                Start-Sleep -Milliseconds 100
+            } until ($job)
+
+            # Not sure why I need to call Wait-Job here but if I don't, error exit codes don't cause Write-Error to return all the way back to the caller
+            $null = $job | Wait-Job
+            $job | Receive-Job -AutoRemoveJob -Wait
+
+            for ($try = 0; $try -lt 3; $try++) {
+                # It can take a few seconds for the scheduled job to be able to be unregistered after the last execution
+                try {
+                    $jobDefinition | Unregister-ScheduledJob -ErrorAction Stop -Force
+                    break
+                } catch {
+                    if ($try -ge 2) {
+                        throw
+                    }
+                    Start-Sleep -Seconds 5
+                }
+            }
+        }
+
+        
+        Write-Error($Credentials.Username)
+
+        foreach ($computer in $ComputerName) {
+            $commandParams = @{
+                ComputerName = $computer
+                ScriptBlock = $script
+                ArgumentList = @($AuthServer.ToString(), $Credentials.Username, $Credentials.GetNetworkCredential().Password)
+            }
+            if ($AsJob) {
+                Start-Job -Name "Register $computer" -ScriptBlock {
+                    param([hashtable]$Arguments)
+
+                    $script = [scriptblock]::Create($Arguments.ScriptBlock)
+                    $commandParams = @{
+                        ComputerName = $Arguments.ComputerName
+                        ScriptBlock = $script
+                        ArgumentList = $Arguments.ArgumentList
+                     }
+
+                    $User = $Arguments.ArgumentList[1]
+                    $PWord = ConvertTo-SecureString -String $Arguments.ArgumentList[2] -AsPlainText -Force 
+                    $cred2 = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $User, $PWord
+
+                    Invoke-Command @commandParams -Credential $cred2 
+                } -ArgumentList $commandParams
+            }
+            else {
+                Invoke-Command @commandParams
+            }
+        }
+    }
+}
+
+
+$User = $args[2].substring(1) 
+$PWord = ConvertTo-SecureString -String $args[4].substring(1)  -AsPlainText -Force 
+$cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $User, $PWord
+#$idpServer = "http://" + $args[6].substring(1)
+$idpServer = "http://10.1.0.93"
+
+
+$jobs = Register-VmsServer -ComputerName $args[0].substring(1) -AuthServer $idpServer -Credentials $cred -AsJob
+$jobs | Receive-Job -Wait -AutoRemoveJob

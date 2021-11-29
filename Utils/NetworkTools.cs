@@ -1,0 +1,92 @@
+﻿
+using System.Linq;
+using System.Management;
+using System.Net;
+using System.Security.Principal;
+
+namespace XProtectDeployer.Utils
+{
+    class NetworkTools
+    {
+
+        internal static bool IsLocalServer(string address)
+        {
+
+            IPAddress remoteHostEntry;
+            bool ValidateIP = IPAddress.TryParse(address, out remoteHostEntry);
+
+            if (!ValidateIP)
+            {
+                remoteHostEntry = Dns.GetHostEntry(address).AddressList.FirstOrDefault();
+            }
+
+
+            IPHostEntry localHostEntry = Dns.GetHostEntry(Dns.GetHostName());
+            return localHostEntry.AddressList.Contains(remoteHostEntry);
+        }
+
+        internal static string GetHostname() {
+            return Dns.GetHostEntry(Dns.GetHostName()).HostName;
+        }
+
+        internal static ManagementScope EstablishConnection(WorkstationInfo workstationInfo)
+        {
+            ConnectionOptions theConnection = new ConnectionOptions();
+            theConnection.Authority = "ntlmdomain:" + workstationInfo.Domain;
+            theConnection.Username = workstationInfo.User;
+            theConnection.Password = workstationInfo.Password;
+            return new ManagementScope("\\\\" + workstationInfo.Address + "\\root\\cimv2", theConnection);
+        }
+
+
+        internal static ManagementBaseObject SetShareParams(ManagementClass winShareClass, string filepath, string sharename)
+        {
+            var shareParams = winShareClass.GetMethodParameters("Create");
+            shareParams["Path"] = filepath;
+            shareParams["Name"] = sharename;
+            shareParams["Type"] = 0;
+            shareParams["Description"] = "Milestone HotFix";
+            shareParams["MaximumAllowed"] = 10;
+            shareParams["Password"] = null;
+
+            NTAccount everyoneAccount = new NTAccount(null, "EVERYONE");
+            SecurityIdentifier sid = (SecurityIdentifier)everyoneAccount.Translate(typeof(SecurityIdentifier));
+            byte[] sidArray = new byte[sid.BinaryLength];
+            sid.GetBinaryForm(sidArray, 0);
+
+            ManagementObject everyone = new ManagementClass("Win32_Trustee");
+            everyone["Domain"] = null;
+            everyone["Name"] = "EVERYONE";
+            everyone["SID"] = sidArray;
+
+            ManagementObject dacl = new ManagementClass("Win32_Ace");
+            dacl["AccessMask"] = 2032127;
+            dacl["AceFlags"] = 3;
+            dacl["AceType"] = 0;
+            dacl["Trustee"] = everyone;
+
+            ManagementObject securityDescriptor = new ManagementClass("Win32_SecurityDescriptor");
+            securityDescriptor["ControlFlags"] = 4; //SE_DACL_PRESENT 
+            securityDescriptor["DACL"] = new object[] { dacl };
+
+            shareParams["Access"] = securityDescriptor;
+            return shareParams;
+        }
+
+
+        internal static string ResolveHostNametoIP(string host)
+        {
+            IPHostEntry hostEntry;
+
+            IPAddress ipaddress;
+            bool ValidateIP = IPAddress.TryParse(host, out ipaddress);
+            if (ValidateIP)
+                return host;
+            else
+            {
+                hostEntry = Dns.GetHostEntry(host);
+                return hostEntry.AddressList.Where(ip => ip.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork).FirstOrDefault().ToString();
+            }
+        }
+    }
+}
